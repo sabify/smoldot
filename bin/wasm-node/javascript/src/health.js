@@ -45,207 +45,211 @@
 // Thanks to this subscription, the latency of the report of the switch from `isSyncing: true` to
 // `isSyncing: false` is very low.
 //
-export function healthChecker() {
-    // `null` if health checker is not started.
-    let checker = null;
-    let sendJsonRpc = null;
+export class HealthChecker {
+  checker;
+  sendJsonRpc;
 
-    return {
-        setSendJsonRpc: (cb) => {
-            sendJsonRpc = cb;
-        },
+  constructor() {
+    this.checker = this.#checker();
+    this.sendJsonRpc = null;
+  }
 
-        start: (healthCallback) => {
-            if (checker !== null)
-                throw new Error("Can't start the health checker multiple times in parallel");
-            if (!sendJsonRpc)
-                throw new Error("setSendJsonRpc must be called before starting the health checks");
+  setSendJsonRpc = (cb) => {
+    this.sendJsonRpc = cb;
+  }
 
-            checker = {
-                healthCallback,
-                currentHealthCheckId: null,
-                currentHealthTimeout: null,
-                currentSubunsubRequestId: null,
-                currentSubscriptionId: null,
-                isSyncing: false,
-                nextRequestId: 0,
+  start = (healthCallback) => {
+    if (this.checker !== null)
+      throw new Error("Can't start the health checker multiple times in parallel");
+    if (!sendJsonRpc)
+      throw new Error("setSendJsonRpc must be called before starting the health checks");
+    checker.startHealthCheck();
+  }
 
-                sendJsonRpc: function (request) {
-                    // Replace the `id` in the request to prefix the request ID with `extern:`.
-                    let parsedRequest;
-                    try {
-                        parsedRequest = JSON.parse(request);
-                    } catch (err) {
-                        return;
-                    };
+  stop = () => {
+    if (checker === null)
+        return; // Already stopped.
+    this.checker.destroy();
+    this.checker = null;
+  }
 
-                    if (parsedRequest.id) {
-                        const newId = 'extern:' + JSON.stringify(parsedRequest.id);
-                        parsedRequest.id = newId;
-                    }
+  sendJsonRpc = (request) => {
+    if (!this.sendJsonRpc)
+        throw new Error("setSendJsonRpc must be called before sending requests");
+    if (checker === null)
+        this.sendJsonRpc(request);
+    else
+        this.checker.sendJsonRpc(request);
+}
 
-                    sendJsonRpc(JSON.stringify(parsedRequest));
-                },
+  responsePassThrough = (jsonRpcResponse) => {
+    if (checker === null)
+      return jsonRpcResponse;
+    return this.checker.responsePassThrough(jsonRpcResponse);
+  }
 
-                responsePassThrough: function (jsonRpcResponse) {
-                    let parsedResponse;
-                    try {
-                        parsedResponse = JSON.parse(jsonRpcResponse);
-                    } catch (err) {
-                        return jsonRpcResponse;
-                    };
+  #checker = () => ({
+    healthCallback,
+    currentHealthCheckId: null,
+    currentHealthTimeout: null,
+    currentSubunsubRequestId: null,
+    currentSubscriptionId: null,
+    isSyncing: false,
+    nextRequestId: 0,
 
-                    // Check whether response is a response to `system_health`.
-                    if (parsedResponse.id && this.currentHealthCheckId == parsedResponse.id) {
-                        this.currentHealthCheckId = null;
+    sendJsonRpc: function (request) {
+      // Replace the `id` in the request to prefix the request ID with `extern:`.
+      let parsedRequest;
+      try {
+        parsedRequest = JSON.parse(request);
+      } catch (err) {
+          return;
+      };
 
-                        // Check whether query was successful. It is possible for queries to fail for
-                        // various reasons, such as the client being overloaded.
-                        if (!parsedResponse.result) {
-                            this.update();
-                            return null;
-                        }
+      if (parsedRequest.id) {
+        const newId = 'extern:' + JSON.stringify(parsedRequest.id);
+        parsedRequest.id = newId;
+      }
 
-                        this.healthCallback(parsedResponse.result);
-                        this.isSyncing = parsedResponse.result.isSyncing;
-                        this.update();
-                        return null;
-                    }
+      sendJsonRpc(JSON.stringify(parsedRequest));
+    },
 
-                    // Check whether response is a response to the subscription or unsubscription.
-                    if (parsedResponse.id && this.currentSubunsubRequestId == parsedResponse.id) {
-                        this.currentSubunsubRequestId = null;
+    responsePassThrough: function (jsonRpcResponse) {
+      let parsedResponse;
+      try {
+        parsedResponse = JSON.parse(jsonRpcResponse);
+      } catch (err) {
+        return jsonRpcResponse;
+      };
 
-                        // Check whether query was successful. It is possible for queries to fail for
-                        // various reasons, such as the client being overloaded.
-                        if (!parsedResponse.result) {
-                            this.update();
-                            return null;
-                        }
+      // Check whether response is a response to `system_health`.
+      if (parsedResponse.id && this.currentHealthCheckId == parsedResponse.id) {
+        this.currentHealthCheckId = null;
 
-                        if (this.currentSubscriptionId)
-                            this.currentSubscriptionId = null;
-                        else
-                            this.currentSubscriptionId = parsedResponse.result;
+        // Check whether query was successful. It is possible for queries to fail for
+        // various reasons, such as the client being overloaded.
+        if (!parsedResponse.result) {
+          this.update();
+          return null;
+        }
 
-                        this.update();
-                        return null;
-                    }
+        this.healthCallback(parsedResponse.result);
+        this.isSyncing = parsedResponse.result.isSyncing;
+        this.update();
+        return null;
+      }
 
-                    // Check whether response is a notification to a subscription.
-                    if (parsedResponse.params && this.currentSubscriptionId &&
-                        parsedResponse.params.subscription == this.currentSubscriptionId) {
-                        // Note that after a successful subscription, a notification containing
-                        // the current best block is always returned. Considering that a
-                        // subscription is performed in response to a health check, calling
-                        // `startHealthCheck()` here will lead to a second health check.
-                        // It might seem redundant to perform two health checks in a quick
-                        // succession, but doing so doesn't lead to any problem, and it is
-                        // actually possible for the health to have changed in between as the
-                        // current best block might have been updated during the subscription
-                        // request.
-                        this.startHealthCheck();
-                        this.update();
-                        return null;
-                    }
+      // Check whether response is a response to the subscription or unsubscription.
+      if (parsedResponse.id && this.currentSubunsubRequestId == parsedResponse.id) {
+        this.currentSubunsubRequestId = null;
 
-                    // Response doesn't concern us.
-                    if (parsedResponse.id) {
-                        // Need to remove the `extern:` prefix.
-                        if (!parsedResponse.id.startsWith('extern:'))
-                            throw new Error('State inconsistency in health checker');
-                        const newId = JSON.parse(parsedResponse.id.slice('extern:'.length));
-                        parsedResponse.id = newId;
-                    }
+        // Check whether query was successful. It is possible for queries to fail for
+        // various reasons, such as the client being overloaded.
+        if (!parsedResponse.result) {
+          this.update();
+          return null;
+        }
 
-                    return JSON.stringify(parsedResponse);
-                },
+        if (this.currentSubscriptionId)
+          this.currentSubscriptionId = null;
+        else
+          this.currentSubscriptionId = parsedResponse.result;
 
-                update: function () {
-                    if (!this.currentHealthTimeout) {
-                        this.currentHealthTimeout = setTimeout(() => {
-                            this.currentHealthTimeout = null;
-                            this.startHealthCheck();
-                        }, 10000);
-                    }
+        this.update();
+        return null;
+      }
 
-                    if (this.isSyncing && !this.currentSubscriptionId && !this.currentSubunsubRequestId)
-                        this.startSubscription();
-                    if (!this.isSyncing && this.currentSubscriptionId && !this.currentSubunsubRequestId)
-                        this.endSubscription();
-                },
+      // Check whether response is a notification to a subscription.
+      if (parsedResponse.params && this.currentSubscriptionId &&
+        parsedResponse.params.subscription == this.currentSubscriptionId) {
+        // Note that after a successful subscription, a notification containing
+        // the current best block is always returned. Considering that a
+        // subscription is performed in response to a health check, calling
+        // `startHealthCheck()` here will lead to a second health check.
+        // It might seem redundant to perform two health checks in a quick
+        // succession, but doing so doesn't lead to any problem, and it is
+        // actually possible for the health to have changed in between as the
+        // current best block might have been updated during the subscription
+        // request.
+        this.startHealthCheck();
+        this.update();
+        return null;
+      }
 
-                startHealthCheck: function () {
-                    if (this.currentHealthCheckId)
-                        throw new Error('Internal error in health checker');
-                    if (this.currentHealthTimeout) {
-                        clearTimeout(this.currentHealthTimeout);
-                        this.currentHealthTimeout = null;
-                    }
-                    this.currentHealthCheckId = "health-checker:" + this.nextRequestId;
-                    this.nextRequestId += 1;
-                    sendJsonRpc(JSON.stringify({
-                        jsonrpc: "2.0",
-                        id: this.currentHealthCheckId,
-                        method: 'system_health',
-                        params: [],
-                    }));
-                },
+      // Response doesn't concern us.
+      if (parsedResponse.id) {
+        // Need to remove the `extern:` prefix.
+        if (!parsedResponse.id.startsWith('extern:'))
+            throw new Error('State inconsistency in health checker');
+        const newId = JSON.parse(parsedResponse.id.slice('extern:'.length));
+        parsedResponse.id = newId;
+      }
 
-                startSubscription: function () {
-                    if (this.currentSubunsubRequestId || this.currentSubscriptionId)
-                        throw new Error('Internal error in health checker');
-                    this.currentSubunsubRequestId = "health-checker:" + this.nextRequestId;
-                    this.nextRequestId += 1;
-                    sendJsonRpc(JSON.stringify({
-                        jsonrpc: "2.0",
-                        id: this.currentSubunsubRequestId,
-                        method: 'chain_subscribeNewHeads',
-                        params: [],
-                    }));
-                },
+      return JSON.stringify(parsedResponse);
+    },
 
-                endSubscription: function () {
-                    if (this.currentSubunsubRequestId || !this.currentSubscriptionId)
-                        throw new Error('Internal error in health checker');
-                    this.currentSubunsubRequestId = "health-checker:" + this.nextRequestId;
-                    this.nextRequestId += 1;
-                    sendJsonRpc(JSON.stringify({
-                        jsonrpc: "2.0",
-                        id: this.currentSubunsubRequestId,
-                        method: 'chain_unsubscribeNewHeads',
-                        params: [this.currentSubscriptionId],
-                    }));
-                },
+      update: function () {
+        if (!this.currentHealthTimeout) {
+          this.currentHealthTimeout = setTimeout(() => {
+            this.currentHealthTimeout = null;
+            this.startHealthCheck();
+          }, 10000);
+        }
 
-                destroy: function () {
-                    if (this.currentHealthTimeout) {
-                        clearTimeout(this.currentHealthTimeout);
-                        this.currentHealthTimeout = null;
-                    }
-                }
-            };
+        if (this.isSyncing && !this.currentSubscriptionId && !this.currentSubunsubRequestId)
+          this.startSubscription();
+        if (!this.isSyncing && this.currentSubscriptionId && !this.currentSubunsubRequestId)
+          this.endSubscription();
+      },
 
-            checker.startHealthCheck();
-        },
-        stop: () => {
-            if (checker === null)
-                return; // Already stopped.
-            checker.destroy();
-            checker = null;
-        },
-        sendJsonRpc: (request) => {
-            if (!sendJsonRpc)
-                throw new Error("setSendJsonRpc must be called before sending requests");
-            if (checker === null)
-                sendJsonRpc(request);
-            else
-                checker.sendJsonRpc(request);
-        },
-        responsePassThrough: (jsonRpcResponse) => {
-            if (checker === null)
-                return jsonRpcResponse;
-            return checker.responsePassThrough(jsonRpcResponse);
-        },
-    };
+      startHealthCheck: function () {
+          if (this.currentHealthCheckId)
+              throw new Error('Internal error in health checker');
+          if (this.currentHealthTimeout) {
+              clearTimeout(this.currentHealthTimeout);
+              this.currentHealthTimeout = null;
+          }
+          this.currentHealthCheckId = "health-checker:" + this.nextRequestId;
+          this.nextRequestId += 1;
+          sendJsonRpc(JSON.stringify({
+              jsonrpc: "2.0",
+              id: this.currentHealthCheckId,
+              method: 'system_health',
+              params: [],
+          }));
+      },
+
+      startSubscription: function () {
+          if (this.currentSubunsubRequestId || this.currentSubscriptionId)
+              throw new Error('Internal error in health checker');
+          this.currentSubunsubRequestId = "health-checker:" + this.nextRequestId;
+          this.nextRequestId += 1;
+          sendJsonRpc(JSON.stringify({
+              jsonrpc: "2.0",
+              id: this.currentSubunsubRequestId,
+              method: 'chain_subscribeNewHeads',
+              params: [],
+          }));
+      },
+
+      endSubscription: function () {
+          if (this.currentSubunsubRequestId || !this.currentSubscriptionId)
+              throw new Error('Internal error in health checker');
+          this.currentSubunsubRequestId = "health-checker:" + this.nextRequestId;
+          this.nextRequestId += 1;
+          sendJsonRpc(JSON.stringify({
+              jsonrpc: "2.0",
+              id: this.currentSubunsubRequestId,
+              method: 'chain_unsubscribeNewHeads',
+              params: [this.currentSubscriptionId],
+          }));
+      },
+
+      destroy: function () {
+          if (this.currentHealthTimeout) {
+              clearTimeout(this.currentHealthTimeout);
+              this.currentHealthTimeout = null;
+          }
+      }
+  });
 }
